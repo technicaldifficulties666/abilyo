@@ -1,0 +1,36 @@
+{
+  "name": "ai-accessibility-auditor",
+  "version": "1.0.0",
+  "description": "AI-powered Web Accessibility Agent using Mastra and Stagehand",
+  "main": "dist/index.js",
+  "scripts": {
+    "audit": "ts-node src/scripts/audit.ts",
+    "build": "tsc",
+    "dev": "ts-node src/scripts/audit.ts"
+  },
+  "keywords": [
+    "accessibility",
+    "wcag",
+    "a11y",
+    "audit",
+    "mastra",
+    "stagehand"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@ai-sdk/openai": "^0.0.66",
+    "@axe-core/playwright": "^4.11.1",
+    "@browserbasehq/stagehand": "^1.5.0",
+    "@mastra/core": "^1.4.0",
+    "axe-playwright": "^2.2.2",
+    "dotenv": "^16.4.5",
+    "playwright": "^1.58.2",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.11",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
