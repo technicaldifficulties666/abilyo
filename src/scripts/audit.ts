@@ -55,32 +55,41 @@ async function runAccessibilityAudit(url: string) {
 
     const observationPrompt = `Perform a COMPLETE and EXHAUSTIVE accessibility audit on ${url}.
 
-## MANDATORY STEPS — DO NOT SKIP ANY:
+## MANDATORY STEPS — EXECUTE IN ORDER:
 
-STEP 1: Call 'observe_accessibility_issues' with the URL to run both Axe-core and AI scans.
+STEP 0 — DOM SNAPSHOT (do this first, before anything else):
+Call 'get_dom_snapshot' with "${url}".
+Read the 'structuralIssues' and 'summary' returned. Note 'existingLandmarkTags' — this is your ground truth for what landmarks already exist on the page. You MUST NOT suggest adding a landmark that already appears in this list as a duplicate.
 
-STEP 2: Process EVERY item in 'technicalViolations' (from Axe) AND 'semanticObservations' (from AI).
-- For EACH violation, call 'extract_code_snippets' to get the HTML and generate a fix.
-- Pass the page title as 'siteContext' on every call.
-- Do NOT skip empty links, empty buttons, or heading hierarchy issues.
-- Violations you MUST check explicitly:
-  * Empty <a> tags (no text, no aria-label) — these are WCAG 4.1.2 violations
-  * Missing or skipped heading levels — check for h1, then h2, h3 in order
-  * Images with generic alt text like 'profile-image', 'photo', 'img'
-  * Color contrast (flag any visually low-contrast text)
-  * Focus indicators (tab through the page mentally — are outlines visible?)
-  * Missing <main>, <nav>, <header>, <footer> landmarks
-  * Form inputs without labels
-  * Buttons or links with no descriptive text
+STEP 1 — AXE + AI SCAN:
+Call 'observe_accessibility_issues' with "${url}".
 
-STEP 3: After extracting ALL issues, call 'generate_accessibility_report' with the complete compiled list.
+STEP 2 — EXTRACT CODE FOR EACH UNIQUE RULE:
+For each entry in 'technicalViolations' (keyed by 'ruleId'), call 'extract_code_snippets' ONCE.
+- Use the FIRST instance's 'cssSelector' as the selector argument.
+- Collect ALL instance cssSelectors from the 'instances' array into the 'selectors' field of your report entry.
+- ONE ruleId = ONE report entry. Never create separate entries for different instances of the same rule.
 
-## RULES:
-- Minimum expected issues for any real website: 4+. If you find fewer, you have missed something — go back and look harder.
-- 'suggestedFix' MUST be different from 'currentCode'. If identical, rewrite until it isn't.
-- 'currentCode' must NEVER be the string "null" — use the actual HTML or a descriptive comment.
-- Every issue needs all fields: element, selectors, elementType, message, issue, help, severity, wcagCriteria, wcagName, currentCode, suggestedFix, explanation.
-- Use the DEDUPLICATION rule: if the same issue appears on multiple elements, group them into one entry with multiple selectors.`;
+STEP 3 — SEMANTIC & STRUCTURAL GAPS:
+Review 'semanticObservations' and 'structuralIssues' (from the snapshot) for issues Axe did not catch.
+Call 'extract_code_snippets' for each new, non-duplicate issue found.
+Issues to check explicitly if not already covered by Axe:
+  * Images with generic alt text ('profile-image', 'photo', 'img', 'icon')
+  * Missing or skipped heading levels (h1 → h3 skipping h2)
+  * focus indicators (are keyboard outlines visible?)
+  * Colour contrast (visually obvious low-contrast text)
+  * Buttons or icon-only links with no accessible label
+
+STEP 4 — GENERATE REPORT:
+Call 'generate_accessibility_report' with the complete deduplicated list.
+
+## HARD RULES:
+- ONE <main> per page. If the snapshot shows mainCount >= 1, never wrap individual elements in <main>.
+- ONE entry per Axe ruleId. All instances go in one entry's 'selectors' array.
+- 'suggestedFix' MUST differ from 'currentCode'.
+- 'currentCode' must never be the string "null" or a placeholder like "<img src='image-source.jpg'>".
+- Pass the site owner's name as 'siteContext' on every extract_code_snippets call.
+- All fields required: element, selectors, elementType, message, issue, help, severity, wcagCriteria, wcagName, currentCode, suggestedFix, explanation.`;
 
     // Inside runAccessibilityAudit function in audit.ts:
 

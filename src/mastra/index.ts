@@ -8,9 +8,9 @@ import { injectAxe, getViolations } from 'axe-playwright';
 
 // Zod schemas for type-safe extraction
 const AccessibilityIssueSchema = z.object({
-  element: z.string().describe('CSS selector of the element'),
-  selectors: z.array(z.string()).describe('List of all CSS selectors for this element (from Axe)'),
-  elementType: z.string().describe('Type of element (button, img, heading, etc.)'),
+  element: z.string().describe('Stable CSS selector (id, class, or attribute). NEVER an XPath expression.'),
+  selectors: z.array(z.string()).describe('All CSS selectors for all instances of this issue (from Axe cssSelector or derived). No XPaths.'),
+  elementType: z.string().describe('Type of element (button, img, heading, a, div, etc.)'),
   message: z.string().describe('A 1-sentence headline of the error'),
   issue: z.string().describe('Detailed explanation of why this violates accessibility'),
   help: z.string().describe('Actionable, step-by-step developer instructions to fix it'),
@@ -20,6 +20,12 @@ const AccessibilityIssueSchema = z.object({
   currentCode: z.string().describe('The original, broken HTML snippet'),
   suggestedFix: z.string().describe('The corrected HTML/ARIA code (MUST be different)'),
   explanation: z.string().describe('Briefly explain how the fix solves the specific issue'),
+  impactedUsers: z.array(z.enum(['vision', 'hearing', 'mobility', 'cognitive', 'seizure']))
+    .describe('Disability groups that cannot use this page element due to this issue'),
+  businessRisk: z.string()
+    .describe('Potential legal, SEO, or reputational consequence if not fixed (1-2 sentences)'),
+  legalStandard: z.array(z.string())
+    .describe('Applicable legal standards this violates, e.g. ["ADA Title III", "AODA", "EAA", "Section 508"]'),
 });
 
 const AccessibilityReportSchema = z.object({
@@ -77,18 +83,22 @@ const observeAccessibilityIssuesTool: any = createTool({
         console.warn('[Axe] Scan failed, continuing with AI only:', axeError.message);
       }
 
-      // 2. Also extract axe violations with HTML nodes for richer context
+      // 2. Restructure Axe data: ONE entry per rule with all affected instances grouped.
+      // This is the key structural fix — prevents the LLM from creating duplicate issues
+      // for each instance of the same rule (e.g. 3 empty links → 1 issue, not 3).
       const axeViolationSummary = technicalViolations.map((v: any) => ({
-        id: v.id,
+        ruleId: v.id,
         impact: v.impact,
         description: v.description,
         help: v.help,
         helpUrl: v.helpUrl,
-        tags: v.tags,
-        nodes: v.nodes?.map((n: any) => ({
-          html: n.html,
-          target: n.target,
-          failureSummary: n.failureSummary,
+        wcagTags: (v.tags || []).filter((t: string) => t.startsWith('wcag') || t.startsWith('best-practice')),
+        instanceCount: v.nodes?.length || 0,
+        // All CSS selectors from Axe (Axe always emits CSS, never XPath)
+        instances: (v.nodes || []).map((n: any) => ({
+          cssSelector: Array.isArray(n.target) ? n.target.join(' ') : String(n.target || ''),
+          html: n.html || '',
+          failureSummary: n.failureSummary || '',
         })),
       }));
 
@@ -134,33 +144,99 @@ const extractCodeSnippetsTool: any = createTool({
   execute: async ({ selector, issueDescription, siteContext }) => {
     const stagehand = await getStagehand();
     try {
-      // Step 1: Reliably get raw outerHTML via Playwright directly (avoids AI hallucinating "null")
+      // Step 1: Reliably get raw outerHTML AND derive a stable CSS selector.
+      // Handles both CSS selectors (from Axe) and XPath expressions (from Stagehand observe).
       let rawHTML = '';
+      let stableCSSSelector = ''; // derived CSS selector when input is XPath
       try {
-        rawHTML = await stagehand.page.evaluate((sel: string) => {
-          // This code runs in the browser context, so 'document' is available
-          const el = document.querySelector(sel);
-          return el ? el.outerHTML : '';
-        }, selector);
+        const isXPath =
+          selector.startsWith('xpath=') ||
+          selector.startsWith('/html') ||
+          selector.startsWith('(//') ||
+          selector.startsWith('//');
+
+        if (isXPath) {
+          const xpathExpr = selector.startsWith('xpath=') ? selector.slice(6) : selector;
+          const resolved = await stagehand.page.evaluate((xpath: string) => {
+            const result = document.evaluate(
+              xpath, document, null,
+              XPathResult.FIRST_ORDERED_NODE_TYPE, null
+            );
+            const el = result.singleNodeValue as Element | null;
+            if (!el) return { html: '', cssSelector: '' };
+
+            const html = el.outerHTML;
+
+            // Build a stable CSS selector: prefer #id, data attrs, href, meaningful classes
+            const elHtml = el as HTMLElement;
+            if (elHtml.id) return { html, cssSelector: `#${elHtml.id}` };
+
+            // Prefer href for links (most stable identity for <a> elements)
+            if (el.tagName === 'A') {
+              const href = el.getAttribute('href');
+              if (href && href !== '' && href !== '#' && href !== '/') {
+                return { html, cssSelector: `a[href="${href}"]` };
+              }
+            }
+
+            // Data attributes (framework-agnostic, very stable)
+            const dataAttrs = Array.from(el.attributes).filter(a => a.name.startsWith('data-') && !a.name.startsWith('data-sr'));
+            for (const attr of dataAttrs) {
+              const candidate = `[${attr.name}="${attr.value}"]`;
+              try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
+            }
+
+            // Non-CSS-in-JS class names (skip hashed classes like css-1abc2de)
+            const stableClasses = Array.from(el.classList).filter(
+              c => !/^css-[a-z0-9]+$/i.test(c) && c.length > 2
+            );
+            for (const cls of stableClasses) {
+              const candidate = `${el.tagName.toLowerCase()}.${cls}`;
+              try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
+            }
+
+            // role attribute
+            const role = el.getAttribute('role');
+            if (role) {
+              const candidate = `${el.tagName.toLowerCase()}[role="${role}"]`;
+              try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
+            }
+
+            // Fallback: tag name only
+            return { html, cssSelector: el.tagName.toLowerCase() };
+          }, xpathExpr);
+
+          rawHTML = resolved.html || '';
+          stableCSSSelector = resolved.cssSelector || '';
+        } else {
+          rawHTML = await stagehand.page.evaluate((sel: string) => {
+            const el = document.querySelector(sel);
+            return el ? el.outerHTML : '';
+          }, selector);
+        }
       } catch {
-        // Selector may not be valid CSS — skip, AI will find element by description
+        // Selector not resolvable — AI will identify element by description
       }
+
+      // Canonical selector to use in the report — CSS if available, XPath input as last resort
+      const canonicalSelector = stableCSSSelector || selector;
 
       // Step 2: Use Stagehand AI to write the fix
       const extraction = await stagehand.extract({
         instruction: `The element to fix: "${selector}".
 The accessibility issue: "${issueDescription}".
 Site owner / company context: "${siteContext || 'the site owner'}".
+Canonical CSS selector (use this as 'element' key, NOT the XPath): "${canonicalSelector}".
 
 Raw HTML already extracted (use this as currentCode if non-empty):
-${rawHTML || '(Not found via CSS selector — locate visually and extract)'}
+${rawHTML || '(Not found via selector — locate visually and extract)'}
 
 TASK:
-1. 'currentCode': Use the raw HTML above. If empty, find and return the element's outerHTML from the page.
-2. 'suggestedFix': Return the COMPLETE corrected HTML. It MUST differ from currentCode.
-3. DO NOT use placeholder names like "John Doe". Use the actual name from siteContext.
-4. VALID HTML ONLY — no JSX, no fragments, no null bytes.
-5. 'explanation': One sentence on how the fix addresses the WCAG violation.`,
+1. 'currentCode': Use the raw HTML above verbatim. If empty, find the element visually and return its outerHTML.
+2. 'suggestedFix': The COMPLETE corrected HTML. MUST differ from currentCode.
+3. DO NOT use placeholder names like "John Doe" — use the actual name from siteContext.
+4. VALID HTML ONLY — no JSX (<>), no incomplete tags (</>), no null bytes.
+5. 'explanation': One sentence explaining how the fix addresses the specific WCAG violation.`,
         schema: z.object({
           currentCode: z.string(),
           suggestedFix: z.string(),
@@ -174,9 +250,133 @@ TASK:
         extraction.currentCode !== 'null' &&
         extraction.currentCode.trim() !== ''
           ? extraction.currentCode
-          : rawHTML || `<!-- Element matching "${selector}" — HTML not extractable via selector -->`;
+          : rawHTML || `<!-- Element matching "${selector}" — HTML not extractable -->`;
 
-      return { success: true, ...extraction, currentCode: finalCurrentCode };
+      return {
+        success: true,
+        ...extraction,
+        currentCode: finalCurrentCode,
+        cssSelector: canonicalSelector, // always a CSS selector — use this as 'element'
+      };
+    } catch (error: any) {
+      return { success: false, error: error.message };
+    }
+  },
+});
+
+// Tool: DOM Snapshot — extracts a structural brief of the page for accessibility analysis.
+// Must be called FIRST before observation, so the auditor knows what landmarks already exist.
+const domSnapshotTool: any = createTool({
+  id: 'get_dom_snapshot',
+  description: `Extract a structural brief of the page: existing landmarks, heading hierarchy, images, links, and form inputs. Call this FIRST, before observe_accessibility_issues.`,
+  inputSchema: z.object({
+    url: z.string().describe('The current page URL (for reference — page must already be loaded by navigate or observe)'),
+  }),
+  execute: async ({ url: _url }: { url: string }) => {
+    const stagehand = await getStagehand();
+    try {
+      const snapshot = await stagehand.page.evaluate(() => {
+        const landmarks = Array.from(
+          document.querySelectorAll('header, nav, main, footer, aside, [role="main"], [role="navigation"], [role="banner"], [role="contentinfo"]')
+        ).map(el => ({
+          tag: el.tagName.toLowerCase(),
+          role: el.getAttribute('role') || el.tagName.toLowerCase(),
+          id: (el as HTMLElement).id || null,
+          hasContent: (el.textContent?.trim().length || 0) > 0,
+        }));
+
+        const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6')).map(el => ({
+          level: parseInt(el.tagName[1]),
+          text: el.textContent?.trim().slice(0, 120) || '',
+          id: (el as HTMLElement).id || null,
+        }));
+
+        const images = Array.from(document.querySelectorAll('img')).map(el => ({
+          src: (el.getAttribute('src') || '').slice(0, 80),
+          alt: el.getAttribute('alt'),
+          hasAlt: el.hasAttribute('alt'),
+          isDecorativeEmpty: el.getAttribute('alt') === '',
+          isGenericAlt: ['image', 'photo', 'img', 'picture', 'profile-image', 'profile', 'avatar', 'icon'].includes(
+            (el.getAttribute('alt') || '').toLowerCase().trim()
+          ),
+        }));
+
+        const links = Array.from(document.querySelectorAll('a')).map(el => ({
+          href: el.getAttribute('href') || '',
+          text: el.textContent?.trim().slice(0, 100) || '',
+          ariaLabel: el.getAttribute('aria-label') || null,
+          isEmpty: (el.textContent?.trim() || '') === '' && !el.getAttribute('aria-label'),
+          isGeneric: ['click here', 'here', 'read more', 'learn more', 'more', 'link'].includes(
+            (el.textContent?.trim() || '').toLowerCase()
+          ),
+        }));
+
+        const formElements = Array.from(
+          document.querySelectorAll('input:not([type="hidden"]), textarea, select')
+        ).map(el => {
+          const id = (el as HTMLElement).id;
+          const hasExplicitLabel = id ? !!document.querySelector(`label[for="${id}"]`) : false;
+          return {
+            type: el.tagName.toLowerCase() + (el.getAttribute('type') ? `[type="${el.getAttribute('type')}"]` : ''),
+            id: id || null,
+            hasExplicitLabel,
+            hasAriaLabel: el.hasAttribute('aria-label'),
+            hasAriaLabelledby: el.hasAttribute('aria-labelledby'),
+            placeholder: el.getAttribute('placeholder') || null,
+          };
+        });
+
+        return { landmarks, headings, images, links, formElements };
+      });
+
+      // Derive pre-computed structural issues to guide the auditor
+      const structuralIssues: string[] = [];
+      const mainCount = snapshot.landmarks.filter(l => l.tag === 'main' || l.role === 'main').length;
+      const navCount = snapshot.landmarks.filter(l => l.tag === 'nav' || l.role === 'navigation').length;
+      const h1Count = snapshot.headings.filter(h => h.level === 1).length;
+      const emptyLinks = snapshot.links.filter(l => l.isEmpty).length;
+      const genericAltImages = snapshot.images.filter(i => i.isGenericAlt && !i.isDecorativeEmpty).length;
+      const missingAltImages = snapshot.images.filter(i => !i.hasAlt).length;
+      const unlabelledInputs = snapshot.formElements.filter(
+        f => !f.hasExplicitLabel && !f.hasAriaLabel && !f.hasAriaLabelledby
+      ).length;
+
+      if (mainCount === 0) structuralIssues.push('NO <main> landmark — page lacks a main content region');
+      if (mainCount > 1) structuralIssues.push(`MULTIPLE <main> elements (${mainCount}) — only one is allowed per page`);
+      if (navCount === 0) structuralIssues.push('NO <nav> landmark — navigation links lack semantic wrapper');
+      if (h1Count === 0) structuralIssues.push('NO <h1> element — page missing top-level heading');
+      if (h1Count > 1) structuralIssues.push(`MULTIPLE <h1> elements (${h1Count}) — only one is recommended`);
+      if (emptyLinks > 0) structuralIssues.push(`${emptyLinks} empty link(s) with no text or aria-label`);
+      if (missingAltImages > 0) structuralIssues.push(`${missingAltImages} image(s) with no alt attribute at all`);
+      if (genericAltImages > 0) structuralIssues.push(`${genericAltImages} image(s) with generic/non-descriptive alt text`);
+      if (unlabelledInputs > 0) structuralIssues.push(`${unlabelledInputs} form input(s) with no accessible label`);
+
+      // Check for skipped heading levels
+      const levels = snapshot.headings.map(h => h.level);
+      for (let i = 1; i < levels.length; i++) {
+        if (levels[i] - levels[i - 1] > 1) {
+          structuralIssues.push(`Heading level skipped: h${levels[i-1]} → h${levels[i]} (missing h${levels[i-1]+1})`);
+          break;
+        }
+      }
+
+      return {
+        success: true,
+        snapshot,
+        structuralIssues,
+        summary: {
+          mainCount,
+          navCount,
+          h1Count,
+          totalHeadings: snapshot.headings.length,
+          totalImages: snapshot.images.length,
+          emptyLinks,
+          genericAltImages,
+          missingAltImages,
+          unlabelledInputs,
+          existingLandmarkTags: snapshot.landmarks.map(l => l.tag),
+        },
+      };
     } catch (error: any) {
       return { success: false, error: error.message };
     }
@@ -184,7 +384,6 @@ TASK:
 });
 
 // Tool 3: Report
-// Replace your Tool 3 with this slightly cleaner version
 const generateAccessibilityReportTool = createTool({
   id: 'generate_accessibility_report',
   description: `Validates and finalizes the accessibility report.`,
@@ -244,11 +443,38 @@ Your mission is to identify accessibility barriers that prevent people with disa
 
 ### DEDUPLICATION RULE: If multiple elements have the same issue and the same fix (e.g., social media icons in the header and footer), group them into a single issue entry. List all relevant selectors in the selectors array, but only provide one currentCode and suggestedFix.
 
+### AXE DATA STRUCTURE (CRITICAL — READ BEFORE PROCESSING technicalViolations):
+Each entry in 'technicalViolations' has a 'ruleId' and an 'instances' array.
+- 'ruleId' = ONE WCAG rule (e.g., "link-name"). This maps to EXACTLY ONE report issue entry.
+- 'instances' = every element on the page that violates this rule. 'instanceCount' tells you how many.
+- RULE: Create ONE issue entry per ruleId. Put ALL instance cssSelectors in the 'selectors' array. Use the first instance's 'html' as 'currentCode'.
+- NEVER create separate report entries for different instances of the same ruleId — that is a duplication failure.
+- Example: ruleId "link-name" with 3 instances → ONE issue entry, selectors: [".css-nhg5kz", ".css-d4gr0s", ".css-abc123"].
+
+### THE ONE-LANDMARK RULE (CRITICAL — prevents hallucinated broken HTML):
+Before generating ANY fix that introduces a landmark element (<main>, <nav>, <header>, <footer>):
+1. Check 'existingLandmarkTags' from the DOM snapshot ('get_dom_snapshot' summary).
+2. A page must have EXACTLY ONE <main>. If 'existingLandmarkTags' contains 'main', NEVER wrap individual elements in <main>. The issue is that content is OUTSIDE the existing <main>, not that multiple <main>s are needed.
+3. If <main> is ABSENT, the 'selectors' array should contain ALL orphaned non-landmark content selectors. The 'suggestedFix' MUST show a single <main> wrapping ALL of them together — not just the first one. Example pattern:
+
+   WRONG (wraps only one element):
+     suggestedFix: "<main><div data-sr-id='0'>...</div></main>"
+
+   CORRECT (wraps every section):
+     suggestedFix: "<main>\\n  <div data-sr-id='0'>...</div>\\n  <div data-sr-id='2'>...</div>\\n  <div data-sr-id='3'>...</div>\\n  <!-- all remaining page sections --></main>"
+4. Same rule applies to <header>, <nav>, and <footer> — each appears at most once, wrapping ALL relevant content.
+5. When flagging "content not contained by landmarks", the fix restructures ONE landmark to contain ALL affected content — never adds multiple landmark tags of the same type.
+
 ### OUTPUT LOGIC:
-1. Analyze the 'technicalViolations' array. For each violation, call 'extract_code_snippets' to get the HTML.
-2. Analyze the 'semanticObservations' array. For new issues Axe missed, call 'extract_code_snippets'.
-3. Synthesize everything into the 'generate_accessibility_report' tool.
-4. Before calling extract_code_snippets, identify the site owner from the page title and pass it into the siteContext parameter.
+0. Call 'get_dom_snapshot' FIRST with the target URL. This gives you:
+   - Which landmarks already exist (so you never suggest adding duplicate <main>s)
+   - The heading hierarchy (so you can spot skipped levels)
+   - Empty links, missing alt images, unlabelled inputs (pre-computed in structuralIssues)
+1. Call 'observe_accessibility_issues' to run Axe + AI semantic scan.
+2. Process 'technicalViolations': for each unique ruleId, call 'extract_code_snippets' ONCE using the FIRST instance's cssSelector. Collect all instance cssSelectors into the 'selectors' array.
+3. Process 'semanticObservations' and 'structuralIssues' from the snapshot: for issues Axe did NOT cover, call 'extract_code_snippets'.
+4. Synthesize ALL issues into 'generate_accessibility_report'.
+5. Identify the site owner from pageTitle and pass as 'siteContext' on every extract call.
 
 Be thorough. Be technical. Be the advocate for the user with disabilities.
 
@@ -285,9 +511,9 @@ WCAG 2.2 LEVEL AA CRITERIA TO REFERENCE:
 ### REPORTING STRUCTURE (CRITICAL):
 For every issue identified (from Axe or your own observation), you MUST generate a JSON object using these exact keys:
 
-1. **element**: The primary CSS selector.
-2. **selectors**: An array of all relevant selectors identifying the issue.
-3. **elementType**: The tag name or component type (e.g., "button").
+1. **element**: The primary CSS selector. **RULE: NEVER use an XPath string (xpath=/html/...) here. If extract_code_snippets returned a 'cssSelector' field, use that. If you only have an XPath, derive the nearest id, class, href, or data-attribute selector manually.**
+2. **selectors**: An array of all CSS selectors for all instances of this issue. Same rule — no XPaths.
+3. **elementType**: The tag name or component type (e.g., "button", "a", "img").
 4. **message**: A punchy headline (e.g., "Non-Descriptive Alt Text").
 5. **issue**: A deep-dive into the problem. Why is this a barrier for a disabled user?
 6. **help**: Instructions for a developer (e.g., "Add an aria-label or change background to #222").
@@ -297,7 +523,17 @@ For every issue identified (from Axe or your own observation), you MUST generate
 10. **currentCode**: The raw HTML string found on the page.
 11. **suggestedFix**: Your corrected HTML. **RULE: suggestedFix MUST NOT equal currentCode.**
 12. **explanation**: How your fix specifically addresses the WCAG violation.
-13. **VALID HTML ONLY**: The suggestedFix must be valid, standard HTML. Do not include JSX fragments (<>), incomplete tags (</>), or non-standard characters like null bytes (\u0000).
+13. **impactedUsers**: An array of disability groups affected. Choose from: 'vision', 'hearing', 'mobility', 'cognitive', 'seizure'. Most issues affect multiple groups.
+    - Empty links/buttons → ['vision', 'mobility', 'cognitive']
+    - Missing alt text → ['vision']
+    - Heading hierarchy → ['vision', 'cognitive']
+    - Contrast → ['vision', 'cognitive']
+    - Keyboard trap / focus → ['vision', 'mobility']
+    - Missing landmark → ['vision', 'cognitive', 'mobility']
+14. **businessRisk**: 1-2 sentences on the ADA/AODA/EAA legal exposure, SEO penalty, or reputational damage if not fixed. Be specific.
+    - Example: "Under ADA Title III and AODA, icon-only links without accessible names constitute a barrier for screen reader users, creating direct litigation exposure. This pattern was cited in 38% of 2023 web accessibility lawsuits."
+15. **legalStandard**: An array of applicable regulations. Choose from: "ADA Title III", "AODA", "EAA", "Section 508", "EN 301 549", "CVAA".
+16. **VALID HTML ONLY**: The suggestedFix must be valid, standard HTML. Do not include JSX fragments (<>), incomplete tags (</>), or null bytes (\u0000).
 
 ### MERGE & DEDUPLICATION LOGIC:
 - If Axe finds a technical error (like contrast) and you notice a semantic error (like a bad label) on the **same element**, merge them into ONE entry. 
@@ -312,6 +548,7 @@ export const aodaAuditorAgent = new Agent({
   instructions: SYSTEM_PROMPT,
   model: openai('gpt-4o'),
   tools: {
+    domSnapshotTool,
     observeAccessibilityIssuesTool,
     extractCodeSnippetsTool,
     generateAccessibilityReportTool,
