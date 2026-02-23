@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { Stagehand } from '@browserbasehq/stagehand';
 import { openai } from '@ai-sdk/openai';
 import { Mastra } from '@mastra/core';
-import { injectAxe, getViolations } from 'axe-playwright';
+import { injectAxe } from 'axe-playwright';
 
 // Zod schemas for type-safe extraction
 const AccessibilityIssueSchema = z.object({
@@ -20,6 +20,10 @@ const AccessibilityIssueSchema = z.object({
   currentCode: z.string().describe('The original, broken HTML snippet'),
   suggestedFix: z.string().describe('The corrected HTML/ARIA code (MUST be different)'),
   explanation: z.string().describe('Briefly explain how the fix solves the specific issue'),
+  category: z.enum(['content', 'cognitive', 'visual', 'motor', 'structural'])
+    .describe('Issue category: content=alt/labels/links, cognitive=headings/flow/language, visual=contrast/zoom/focus, motor=keyboard/touch/bypass, structural=landmarks/aria'),
+  instanceCount: z.number()
+    .describe('Total page elements affected by this rule. From Axe instanceCount for technical violations; 1 for semantic-only issues.'),
   impactedUsers: z.array(z.enum(['vision', 'hearing', 'mobility', 'cognitive', 'seizure']))
     .describe('Disability groups that cannot use this page element due to this issue'),
   businessRisk: z.string()
@@ -31,13 +35,29 @@ const AccessibilityIssueSchema = z.object({
 const AccessibilityReportSchema = z.object({
   url: z.string(),
   pageTitle: z.string(),
+  scanDate: z.string().optional().describe('ISO 8601 timestamp — set automatically by the report tool'),
   issues: z.array(AccessibilityIssueSchema),
   summary: z.object({
     totalIssues: z.number(),
+    totalAffectedElements: z.number().default(0)
+      .describe('Sum of instanceCounts across all issues — reflects the true scale of violations'),
     critical: z.number(),
     serious: z.number(),
     moderate: z.number(),
     minor: z.number(),
+    passedChecks: z.number().default(0)
+      .describe('Axe rules that passed — pass the passedChecksCount from observe_accessibility_issues'),
+    complianceScore: z.number().default(0)
+      .describe('0-100 score — computed by report tool, set 0 as placeholder'),
+    verdict: z.enum(['compliant', 'partially-compliant', 'non-compliant']).default('non-compliant')
+      .describe('Computed by report tool — set non-compliant as placeholder'),
+    categoryBreakdown: z.object({
+      content: z.number(),
+      cognitive: z.number(),
+      visual: z.number(),
+      motor: z.number(),
+      structural: z.number(),
+    }).default({ content: 0, cognitive: 0, visual: 0, motor: 0, structural: 0 }),
   }),
 });
 
@@ -73,12 +93,27 @@ const observeAccessibilityIssuesTool: any = createTool({
       await stagehand.page.goto(url, { waitUntil: 'networkidle' });
       const pageTitle = await stagehand.page.title();
 
-      // 1. Technical Scan: Run Axe-core (getViolations never throws on violations)
+      // 1. Technical Scan: Full Axe ruleset via raw axe.run()
+      // Using page.evaluate to access passes count (needed for compliance score calculation)
       let technicalViolations: any[] = [];
+      let passedChecksCount = 0;
       try {
         await injectAxe(stagehand.page);
-        technicalViolations = await getViolations(stagehand.page);
-        console.log(`[Axe] Found ${technicalViolations.length} technical violations.`);
+        const axeRaw = await stagehand.page.evaluate(async () => {
+          const results = await (window as any).axe.run(document, {
+            runOnly: {
+              type: 'tag',
+              values: ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa', 'best-practice'],
+            },
+          });
+          return {
+            violations: results.violations,
+            passesCount: (results.passes || []).length,
+          };
+        });
+        technicalViolations = axeRaw.violations;
+        passedChecksCount = axeRaw.passesCount;
+        console.log(`[Axe] ${technicalViolations.length} violation rules, ${passedChecksCount} passed checks.`);
       } catch (axeError: any) {
         console.warn('[Axe] Scan failed, continuing with AI only:', axeError.message);
       }
@@ -99,6 +134,8 @@ const observeAccessibilityIssuesTool: any = createTool({
           cssSelector: Array.isArray(n.target) ? n.target.join(' ') : String(n.target || ''),
           html: n.html || '',
           failureSummary: n.failureSummary || '',
+          // Axe check data — most useful for color-contrast: { fgColor, bgColor, contrastRatio, expectedContrastRatio }
+          data: n.any?.[0]?.data || n.none?.[0]?.data || null,
         })),
       }));
 
@@ -124,6 +161,7 @@ List EVERY element you find with any of these issues. Be exhaustive.`,
         url, 
         pageTitle, 
         technicalViolations: axeViolationSummary,
+        passedChecksCount,
         semanticObservations: aiObservations,
       };
     } catch (error: any) {
@@ -390,26 +428,60 @@ const generateAccessibilityReportTool = createTool({
   inputSchema: AccessibilityReportSchema,
   execute: async (report) => {
     console.log(`\n✅ Tool triggered: Generating report for ${report.pageTitle}`);
-    
-    // Save to file directly from the tool
+
+    // Recompute all derived summary fields from actual issue data for accuracy
+    const issues = report.issues as any[];
+    const totalAffectedElements = issues.reduce((sum: number, i: any) => sum + (i.instanceCount || 1), 0);
+
+    const categoryBreakdown = {
+      content:    issues.filter((i: any) => i.category === 'content').length,
+      cognitive:  issues.filter((i: any) => i.category === 'cognitive').length,
+      visual:     issues.filter((i: any) => i.category === 'visual').length,
+      motor:      issues.filter((i: any) => i.category === 'motor').length,
+      structural: issues.filter((i: any) => i.category === 'structural').length,
+    };
+
+    const passedChecks = (report.summary as any).passedChecks || 0;
+    const rawScore = passedChecks / Math.max(1, passedChecks + totalAffectedElements) * 100;
+    const complianceScore = Math.round(rawScore);
+    const verdict: 'compliant' | 'partially-compliant' | 'non-compliant' =
+      complianceScore >= 80 ? 'compliant' :
+      complianceScore >= 50 ? 'partially-compliant' :
+      'non-compliant';
+
+    const finalReport = {
+      ...report,
+      scanDate: new Date().toISOString(),
+      summary: {
+        ...report.summary,
+        totalAffectedElements,
+        categoryBreakdown,
+        complianceScore,
+        verdict,
+        passedChecks,
+      },
+    };
+
+    // Save to file
     const fs = require('fs');
     const path = require('path');
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `accessibility-report-${timestamp}.json`;
     const reportsDir = path.join(process.cwd(), 'reports');
-    
+
     if (!fs.existsSync(reportsDir)) {
       fs.mkdirSync(reportsDir, { recursive: true });
     }
-    
+
     const filepath = path.join(reportsDir, filename);
-    fs.writeFileSync(filepath, JSON.stringify(report, null, 2));
-    
+    fs.writeFileSync(filepath, JSON.stringify(finalReport, null, 2));
+
     console.log(`💾 REPORT SAVED INTERNALLY TO: ${filepath}`);
+    console.log(`📊 Compliance: ${complianceScore}% (${verdict}) | ${totalAffectedElements} affected elements across ${issues.length} rules`);
 
     return {
       success: true,
-      data: report,
+      data: finalReport,
       filePath: filepath
     };
   },
@@ -464,6 +536,26 @@ Before generating ANY fix that introduces a landmark element (<main>, <nav>, <he
      suggestedFix: "<main>\\n  <div data-sr-id='0'>...</div>\\n  <div data-sr-id='2'>...</div>\\n  <div data-sr-id='3'>...</div>\\n  <!-- all remaining page sections --></main>"
 4. Same rule applies to <header>, <nav>, and <footer> — each appears at most once, wrapping ALL relevant content.
 5. When flagging "content not contained by landmarks", the fix restructures ONE landmark to contain ALL affected content — never adds multiple landmark tags of the same type.
+
+### ALT TEXT DISTINCTION (CRITICAL — prevents wrong issue classification):
+- If an image has NO alt attribute at all (Axe ruleId: 'image-alt', domSnapshot 'hasAlt: false'): message = "Missing Alt Attribute", category = 'content'. Do NOT say "Non-Descriptive".
+- If an image DOES have an alt but it is generic ('profile-image', 'photo', 'icon', 'avatar', 'img', 'image', 'picture', 'profile') — this is domSnapshot 'isGenericAlt: true': message = "Non-Descriptive Alt Text", category = 'content'. Do NOT say "Missing Alt Text".
+- Always check the domSnapshot 'images' array and its 'hasAlt' + 'isGenericAlt' flags before classifying alt issues.
+
+### COLOR-CONTRAST REPORTING (REQUIRED — highest-volume category on most pages):
+Color contrast is the #1 cause of accessibility failures. Axe's 'color-contrast' ruleId fires once per element — a page can have 10–40+ affected elements:
+- ONE report entry for ruleId 'color-contrast', but: 'instanceCount' = actual Axe instanceCount (could be 30+), ALL selectors in 'selectors[]'.
+- 'issue': Mention actual failing contrast ratio from Axe's 'instance.data' (e.g., "2.1:1 vs 4.5:1 required for normal text"). Each instance 'data' object has: { fgColor, bgColor, contrastRatio, expectedContrastRatio }.
+- 'suggestedFix': Show the corrected element with a CSS color/background-color that achieves >= 4.5:1 ratio.
+- 'severity': 'serious', 'category': 'visual', 'wcagCriteria': '1.4.3', 'wcagName': 'Contrast (Minimum)'.
+- NEVER omit or skip color-contrast findings — they account for the bulk of real-world accessibility violations.
+
+### SUMMARY COMPUTATION (values to pass to generate_accessibility_report):
+- 'passedChecks': The 'passedChecksCount' from 'observe_accessibility_issues' return data.
+- 'totalAffectedElements': Sum of ALL issue instanceCounts across all issues.
+- 'complianceScore': Set to 0 — the report tool recomputes accurately from passedChecks and totalAffectedElements.
+- 'verdict': Set to 'non-compliant' as placeholder — overwritten by the report tool.
+- 'categoryBreakdown': Count of issues per category (content/cognitive/visual/motor/structural).
 
 ### OUTPUT LOGIC:
 0. Call 'get_dom_snapshot' FIRST with the target URL. This gives you:
@@ -534,6 +626,9 @@ For every issue identified (from Axe or your own observation), you MUST generate
     - Example: "Under ADA Title III and AODA, icon-only links without accessible names constitute a barrier for screen reader users, creating direct litigation exposure. This pattern was cited in 38% of 2023 web accessibility lawsuits."
 15. **legalStandard**: An array of applicable regulations. Choose from: "ADA Title III", "AODA", "EAA", "Section 508", "EN 301 549", "CVAA".
 16. **VALID HTML ONLY**: The suggestedFix must be valid, standard HTML. Do not include JSX fragments (<>), incomplete tags (</>), or null bytes (\u0000).
+
+17. **category**: Classify into ONE: 'content' (alt text, link/button/form labels), 'cognitive' (heading hierarchy, reading order, language, navigation consistency), 'visual' (color contrast, zoom, text size, focus indicators), 'motor' (keyboard access, skip navigation, touch targets, focus order), 'structural' (missing landmarks, semantic HTML, ARIA roles).
+18. **instanceCount**: Total page elements affected by this rule violation. Use Axe's 'instanceCount' for technical issues. For semantic-only issues, count affected elements manually (minimum 1). This powers the compliance score and affected-element totals the client sees.
 
 ### MERGE & DEDUPLICATION LOGIC:
 - If Axe finds a technical error (like contrast) and you notice a semantic error (like a bad label) on the **same element**, merge them into ONE entry. 

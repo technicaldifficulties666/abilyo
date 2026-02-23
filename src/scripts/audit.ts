@@ -68,6 +68,8 @@ STEP 2 — EXTRACT CODE FOR EACH UNIQUE RULE:
 For each entry in 'technicalViolations' (keyed by 'ruleId'), call 'extract_code_snippets' ONCE.
 - Use the FIRST instance's 'cssSelector' as the selector argument.
 - Collect ALL instance cssSelectors from the 'instances' array into the 'selectors' field of your report entry.
+- Set 'instanceCount' to the Axe 'instanceCount' field (number of affected elements for this rule).
+- For 'color-contrast': MUST be processed and included. If Axe returns contrast violations, include them with ALL affected selectors and the contrast ratio from instance 'data' (fgColor, bgColor, contrastRatio). This is typically the highest-volume category.
 - ONE ruleId = ONE report entry. Never create separate entries for different instances of the same rule.
 
 STEP 3 — SEMANTIC & STRUCTURAL GAPS:
@@ -89,7 +91,10 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
 - 'suggestedFix' MUST differ from 'currentCode'.
 - 'currentCode' must never be the string "null" or a placeholder like "<img src='image-source.jpg'>".
 - Pass the site owner's name as 'siteContext' on every extract_code_snippets call.
-- All fields required: element, selectors, elementType, message, issue, help, severity, wcagCriteria, wcagName, currentCode, suggestedFix, explanation.`;
+- Set summary.passedChecks to the 'passedChecksCount' value returned by 'observe_accessibility_issues'.
+- Set summary.totalAffectedElements to the sum of all issue instanceCounts.
+- Set summary.categoryBreakdown to counts per category: content/cognitive/visual/motor/structural.
+- All fields required: element, selectors, elementType, message, issue, help, severity, wcagCriteria, wcagName, currentCode, suggestedFix, explanation, category, instanceCount, impactedUsers, businessRisk, legalStandard.`;
 
     // Inside runAccessibilityAudit function in audit.ts:
 
@@ -128,14 +133,21 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
       console.log("═".repeat(60));
       console.log(`\n🌐 URL: ${report.url}`);
       console.log(`📄 Page: ${report.pageTitle}`);
+      const summary = report.summary as any;
       console.log(`\n📊 Summary:`);
-      console.log(
-        `   Total Issues: ${report.summary?.totalIssues || report.issues.length}`,
-      );
-      console.log(`   🔴 Critical: ${report.summary?.critical || 0}`);
-      console.log(`   🟠 Serious: ${report.summary?.serious || 0}`);
-      console.log(`   🟡 Moderate: ${report.summary?.moderate || 0}`);
-      console.log(`   🟢 Minor: ${report.summary?.minor || 0}`);
+      console.log(`   Total Issues: ${summary?.totalIssues || report.issues.length}`);
+      console.log(`   Total Affected Elements: ${summary?.totalAffectedElements ?? report.issues.length}`);
+      console.log(`   Compliance Score: ${summary?.complianceScore ?? 'N/A'}%  |  Verdict: ${summary?.verdict || 'N/A'}`);
+      console.log(`   Passed Checks: ${summary?.passedChecks ?? 'N/A'}`);
+      console.log(`   🔴 Critical: ${summary?.critical || 0}`);
+      console.log(`   🟠 Serious:  ${summary?.serious || 0}`);
+      console.log(`   🟡 Moderate: ${summary?.moderate || 0}`);
+      console.log(`   🟢 Minor:    ${summary?.minor || 0}`);
+      const catBr = summary?.categoryBreakdown;
+      if (catBr) {
+        console.log(`\n📁 Category Breakdown:`);
+        console.log(`   Content: ${catBr.content ?? 0}  |  Cognitive: ${catBr.cognitive ?? 0}  |  Visual: ${catBr.visual ?? 0}  |  Motor: ${catBr.motor ?? 0}  |  Structural: ${catBr.structural ?? 0}`);
+      }
       console.log("\n" + "─".repeat(60));
 
       // Display each issue
@@ -150,8 +162,11 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
 
         console.log(`\n${severityEmoji} Issue ${index + 1}: ${issue.issue}`);
         console.log(`   Element: ${issue.element}`);
-        console.log(`   WCAG: ${issue.wcagCriteria} - ${issue.wcagName}`);
+        console.log(`   Category: ${(issue as any).category || 'N/A'}  |  Affected: ${(issue as any).instanceCount ?? 1} element(s)`);
+        console.log(`   WCAG: ${issue.wcagCriteria} — ${issue.wcagName}`);
         console.log(`   Severity: ${issue.severity.toUpperCase()}`);
+        if ((issue as any).businessRisk) console.log(`   ⚠️  Risk: ${(issue as any).businessRisk}`);
+        if ((issue as any).legalStandard?.length) console.log(`   ⚖️  Legal: ${(issue as any).legalStandard.join(', ')}`);
         console.log(`\n   ❌ Current Code:`);
         console.log(`   ${issue.currentCode.split("\n").join("\n   ")}`);
         console.log(`\n   ✅ Suggested Fix:`);
