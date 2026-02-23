@@ -70,6 +70,7 @@ For each entry in 'technicalViolations' (keyed by 'ruleId'), call 'extract_code_
 - Collect ALL instance cssSelectors from the 'instances' array into the 'selectors' field of your report entry.
 - Set 'instanceCount' to the Axe 'instanceCount' field (number of affected elements for this rule).
 - For 'color-contrast': MUST be processed and included. If Axe returns contrast violations, include them with ALL affected selectors and the contrast ratio from instance 'data' (fgColor, bgColor, contrastRatio). This is typically the highest-volume category.
+- For 'region', 'bypass', 'landmark-*', or any rule where the fix involves wrapping siblings in a landmark: pass 'useParentElement: true' to extract_code_snippets. This fetches the full parent container so the suggestedFix can wrap ALL children without truncation.
 - ONE ruleId = ONE report entry. Never create separate entries for different instances of the same rule.
 
 STEP 3 — SEMANTIC & STRUCTURAL GAPS:

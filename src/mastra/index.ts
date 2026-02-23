@@ -178,8 +178,13 @@ const extractCodeSnippetsTool: any = createTool({
     selector: z.string(),
     issueDescription: z.string(),
     siteContext: z.string().optional().describe('Context about the site owner or company to avoid generic names'),
+    useParentElement: z.boolean().optional().describe(
+      'When true, fetches the PARENT container outerHTML instead of the element itself. ' +
+      'Use for landmark/structural violations where multiple sibling elements all need to be wrapped together ' +
+      '(e.g. region, bypass, landmark rules). Prevents the LLM from seeing only one child and truncating the fix.'
+    ),
   }),
-  execute: async ({ selector, issueDescription, siteContext }) => {
+  execute: async ({ selector, issueDescription, siteContext, useParentElement }) => {
     const stagehand = await getStagehand();
     try {
       // Step 1: Reliably get raw outerHTML AND derive a stable CSS selector.
@@ -257,7 +262,40 @@ const extractCodeSnippetsTool: any = createTool({
       }
 
       // Canonical selector to use in the report — CSS if available, XPath input as last resort
-      const canonicalSelector = stableCSSSelector || selector;
+      let canonicalSelector = stableCSSSelector || selector;
+
+      // LANDMARK/STRUCTURAL FIX: Upgrade to parent container's outerHTML.
+      // The parent holds ALL sibling children at once, so the LLM cannot truncate or drop any of them.
+      // Only skip upgrade if parent is <body> or <html> (too broad to be useful).
+      if (useParentElement) {
+        try {
+          const upgraded = await stagehand.page.evaluate((sel: string) => {
+            const el = document.querySelector(sel);
+            if (!el) return null;
+            const parent = el.parentElement;
+            if (!parent || ['body', 'html'].includes(parent.tagName.toLowerCase())) return null;
+            const html = parent.outerHTML;
+            // Derive stable selector for parent using same priority ladder
+            const parentEl = parent as HTMLElement;
+            if (parentEl.id) return { html, cssSelector: `#${parentEl.id}` };
+            const stableClasses = Array.from(parent.classList).filter(
+              (c: string) => !/^css-[a-z0-9]+$/i.test(c) && c.length > 2
+            );
+            const tag = parent.tagName.toLowerCase();
+            if (stableClasses.length > 0) return { html, cssSelector: `${tag}.${stableClasses[0]}` };
+            const role = parent.getAttribute('role');
+            if (role) return { html, cssSelector: `${tag}[role="${role}"]` };
+            return { html, cssSelector: tag };
+          }, canonicalSelector);
+          if (upgraded?.html) {
+            rawHTML = upgraded.html;
+            if (upgraded.cssSelector) canonicalSelector = upgraded.cssSelector;
+            console.log(`[extract] useParentElement: upgraded to parent selector "${canonicalSelector}"`);
+          }
+        } catch {
+          // Parent resolution failed — fall back to original element HTML
+        }
+      }
 
       // Step 2: Use Stagehand AI to write the fix
       const extraction = await stagehand.extract({
@@ -271,7 +309,7 @@ ${rawHTML || '(Not found via selector — locate visually and extract)'}
 
 TASK:
 1. 'currentCode': Use the raw HTML above verbatim. If empty, find the element visually and return its outerHTML.
-2. 'suggestedFix': The COMPLETE corrected HTML. MUST differ from currentCode.
+2. 'suggestedFix': The COMPLETE corrected HTML. MUST differ from currentCode. If the HTML above is a parent container, the suggestedFix MUST include ALL child elements — do NOT truncate, abbreviate, or drop any children.
 3. DO NOT use placeholder names like "John Doe" — use the actual name from siteContext.
 4. VALID HTML ONLY — no JSX (<>), no incomplete tags (</>), no null bytes.
 5. 'explanation': One sentence explaining how the fix addresses the specific WCAG violation.`,
@@ -537,6 +575,14 @@ Before generating ANY fix that introduces a landmark element (<main>, <nav>, <he
 4. Same rule applies to <header>, <nav>, and <footer> — each appears at most once, wrapping ALL relevant content.
 5. When flagging "content not contained by landmarks", the fix restructures ONE landmark to contain ALL affected content — never adds multiple landmark tags of the same type.
 
+### LANDMARK FIX STRATEGY (prevents truncation — use this every time):
+When calling 'extract_code_snippets' for any issue where the fix involves wrapping multiple sibling elements in a landmark (<main>, <nav>, <header>, <footer>):
+- Pass 'useParentElement: true'.
+- The tool will automatically fetch the PARENT container's full outerHTML. This gives the LLM all sibling children at once.
+- In your 'suggestedFix', change the outer wrapper to the correct landmark tag (or insert the landmark inside it) and include EVERY child without exception. Do NOT abbreviate or comment out any child elements.
+- The 'currentCode' returned will be the parent container. The 'element' key in the report should be the parent's CSS selector.
+- This applies to: 'region' rule, 'bypass' rule, 'landmark-*' rules, any 'structuralIssues' entry involving landmark absence.
+
 ### ALT TEXT DISTINCTION (CRITICAL — prevents wrong issue classification):
 - If an image has NO alt attribute at all (Axe ruleId: 'image-alt', domSnapshot 'hasAlt: false'): message = "Missing Alt Attribute", category = 'content'. Do NOT say "Non-Descriptive".
 - If an image DOES have an alt but it is generic ('profile-image', 'photo', 'icon', 'avatar', 'img', 'image', 'picture', 'profile') — this is domSnapshot 'isGenericAlt: true': message = "Non-Descriptive Alt Text", category = 'content'. Do NOT say "Missing Alt Text".
@@ -608,7 +654,11 @@ For every issue identified (from Axe or your own observation), you MUST generate
 3. **elementType**: The tag name or component type (e.g., "button", "a", "img").
 4. **message**: A punchy headline (e.g., "Non-Descriptive Alt Text").
 5. **issue**: A deep-dive into the problem. Why is this a barrier for a disabled user?
-6. **help**: Instructions for a developer (e.g., "Add an aria-label or change background to #222").
+6. **help**: A 2-3 step actionable developer guide. Each step names the EXACT attribute, element, tag, or CSS property to change. Examples by issue type:
+   - Link name: "1. Locate each icon-only <a> element. 2. Add aria-label='[Destination] — [Owner Name]' directly on the tag (e.g., aria-label='GitHub profile — Subaig Bindra'). 3. Verify with axe DevTools or a screen reader that the link now announces its destination."
+   - Missing landmark: "1. Identify all content <div>s that sit directly under <body> outside any landmark. 2. Wrap them together in a single <main> element. 3. Confirm there is exactly one <main> on the page using browser DevTools (document.querySelectorAll('main').length === 1)."
+   - Contrast: "1. Check the computed foreground and background colors in DevTools (Inspect > Styles). 2. Adjust the foreground or background CSS color until the contrast ratio reaches at least 4.5:1 for normal text or 3:1 for large text (use WebAIM Contrast Checker). 3. Apply the new color as a CSS variable or inline style and re-test with axe."
+   - Alt text: "1. Identify the image's subject (person, product, or context) using surrounding content. 2. Replace the generic alt value with a descriptive phrase of 50-150 characters (e.g., alt='Headshot of Subaig Bindra, a Full-Stack Developer, smiling against a dark background'). 3. For purely decorative images, set alt='' (empty string) and add role='presentation'."
 7. **severity**: Must be 'critical', 'serious', 'moderate', or 'minor'.
 8. **wcagCriteria**: The specific number (e.g., "1.1.1").
 9. **wcagName**: The formal name (e.g., "Non-text Content").
