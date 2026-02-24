@@ -201,6 +201,31 @@ const extractCodeSnippetsTool: any = createTool({
         if (isXPath) {
           const xpathExpr = selector.startsWith('xpath=') ? selector.slice(6) : selector;
           const resolved = await stagehand.page.evaluate((xpath: string) => {
+            // Build a unique CSS path using nth-of-type as last resort
+            function buildUniqueCSSPath(el: Element): string {
+              const parts: string[] = [];
+              let current: Element | null = el;
+              while (current && current.tagName && current.tagName.toLowerCase() !== 'html') {
+                const tag = current.tagName.toLowerCase();
+                const parent: Element | null = current.parentElement;
+                if (!parent) break;
+                if ((current as HTMLElement).id && !/^\d/.test((current as HTMLElement).id)) {
+                  parts.unshift('#' + (current as HTMLElement).id);
+                  break;
+                }
+                const siblings = Array.from(parent.children).filter((s: Element) => s.tagName === current!.tagName);
+                if (siblings.length === 1) {
+                  parts.unshift(tag);
+                } else {
+                  const idx = siblings.indexOf(current) + 1;
+                  parts.unshift(tag + ':nth-of-type(' + idx + ')');
+                }
+                current = parent;
+                if (parts.length >= 4) break;
+              }
+              return parts.join(' > ') || el.tagName.toLowerCase();
+            }
+
             const result = document.evaluate(
               xpath, document, null,
               XPathResult.FIRST_ORDERED_NODE_TYPE, null
@@ -209,12 +234,12 @@ const extractCodeSnippetsTool: any = createTool({
             if (!el) return { html: '', cssSelector: '' };
 
             const html = el.outerHTML;
-
-            // Build a stable CSS selector: prefer #id, data attrs, href, meaningful classes
             const elHtml = el as HTMLElement;
-            if (elHtml.id) return { html, cssSelector: `#${elHtml.id}` };
 
-            // Prefer href for links (most stable identity for <a> elements)
+            // Priority 1: #id
+            if (elHtml.id && !/^\d/.test(elHtml.id)) return { html, cssSelector: '#' + elHtml.id };
+
+            // Priority 2: href for links
             if (el.tagName === 'A') {
               const href = el.getAttribute('href');
               if (href && href !== '' && href !== '#' && href !== '/') {
@@ -222,40 +247,85 @@ const extractCodeSnippetsTool: any = createTool({
               }
             }
 
-            // Data attributes (framework-agnostic, very stable)
-            const dataAttrs = Array.from(el.attributes).filter(a => a.name.startsWith('data-') && !a.name.startsWith('data-sr'));
+            // Priority 3: data attributes (skip data-sr)
+            const dataAttrs = Array.from(el.attributes).filter(
+              a => a.name.startsWith('data-') && !a.name.startsWith('data-sr')
+            );
             for (const attr of dataAttrs) {
               const candidate = `[${attr.name}="${attr.value}"]`;
               try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
             }
 
-            // Non-CSS-in-JS class names (skip hashed classes like css-1abc2de)
+            // Priority 4: stable (non-hashed) class names
             const stableClasses = Array.from(el.classList).filter(
               c => !/^css-[a-z0-9]+$/i.test(c) && c.length > 2
             );
             for (const cls of stableClasses) {
-              const candidate = `${el.tagName.toLowerCase()}.${cls}`;
+              const candidate = el.tagName.toLowerCase() + '.' + cls;
               try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
             }
 
-            // role attribute
+            // Priority 4b: full className (hashed classes guarantee page-load uniqueness)
+            if (elHtml.className && typeof elHtml.className === 'string' && elHtml.className.trim()) {
+              const allClasses = elHtml.className.trim().split(/\s+/).filter(Boolean).join('.');
+              const candidate = el.tagName.toLowerCase() + '.' + allClasses;
+              try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
+            }
+
+            // Priority 5: role attribute
             const role = el.getAttribute('role');
             if (role) {
-              const candidate = `${el.tagName.toLowerCase()}[role="${role}"]`;
+              const candidate = el.tagName.toLowerCase() + '[role="' + role + '"]';
               try { if (document.querySelectorAll(candidate).length === 1) return { html, cssSelector: candidate }; } catch {}
             }
 
-            // Fallback: tag name only
-            return { html, cssSelector: el.tagName.toLowerCase() };
+            // LAST RESORT: unique nth-of-type path
+            return { html, cssSelector: buildUniqueCSSPath(el) };
           }, xpathExpr);
 
-          rawHTML = resolved.html || '';
+          rawHTML = (resolved.html || '').replace(/\0/g, '');
           stableCSSSelector = resolved.cssSelector || '';
         } else {
-          rawHTML = await stagehand.page.evaluate((sel: string) => {
+          // CSS selector path: fetch outerHTML AND upgrade bare tag names to unique paths
+          const upgraded = await stagehand.page.evaluate((sel: string) => {
+            function buildUniqueCSSPath(el: Element): string {
+              const parts: string[] = [];
+              let current: Element | null = el;
+              while (current && current.tagName && current.tagName.toLowerCase() !== 'html') {
+                const tag = current.tagName.toLowerCase();
+                const parent: Element | null = current.parentElement;
+                if (!parent) break;
+                if ((current as HTMLElement).id && !/^\d/.test((current as HTMLElement).id)) {
+                  parts.unshift('#' + (current as HTMLElement).id);
+                  break;
+                }
+                const siblings = Array.from(parent.children).filter((s: Element) => s.tagName === current!.tagName);
+                if (siblings.length === 1) {
+                  parts.unshift(tag);
+                } else {
+                  const idx = siblings.indexOf(current) + 1;
+                  parts.unshift(tag + ':nth-of-type(' + idx + ')');
+                }
+                current = parent;
+                if (parts.length >= 4) break;
+              }
+              return parts.join(' > ') || el.tagName.toLowerCase();
+            }
+
             const el = document.querySelector(sel);
-            return el ? el.outerHTML : '';
+            if (!el) return { html: '', cssSelector: sel };
+            const html = el.outerHTML;
+            const isBareTag = /^[a-z][a-z0-9]*$/i.test(sel.trim());
+            if (isBareTag) {
+              return { html, cssSelector: buildUniqueCSSPath(el) };
+            }
+            return { html, cssSelector: sel };
           }, selector);
+
+          rawHTML = (upgraded.html || '').replace(/\0/g, '');
+          if (upgraded.cssSelector && upgraded.cssSelector !== selector) {
+            stableCSSSelector = upgraded.cssSelector;
+          }
         }
       } catch {
         // Selector not resolvable — AI will identify element by description
@@ -320,13 +390,14 @@ TASK:
         }),
       });
 
-      // Step 3: Guarantee currentCode is never the string "null" or empty
-      const finalCurrentCode =
+      // Step 3: Guarantee currentCode is never the string "null" or empty, and strip null bytes
+      const finalCurrentCode = (
         extraction.currentCode &&
         extraction.currentCode !== 'null' &&
         extraction.currentCode.trim() !== ''
           ? extraction.currentCode
-          : rawHTML || `<!-- Element matching "${selector}" — HTML not extractable -->`;
+          : rawHTML || `<!-- Element matching "${selector}" — HTML not extractable -->`
+      ).replace(/\0/g, '');
 
       return {
         success: true,
@@ -584,9 +655,9 @@ When calling 'extract_code_snippets' for any issue where the fix involves wrappi
 - This applies to: 'region' rule, 'bypass' rule, 'landmark-*' rules, any 'structuralIssues' entry involving landmark absence.
 
 ### ALT TEXT DISTINCTION (CRITICAL — prevents wrong issue classification):
-- If an image has NO alt attribute at all (Axe ruleId: 'image-alt', domSnapshot 'hasAlt: false'): message = "Missing Alt Attribute", category = 'content'. Do NOT say "Non-Descriptive".
-- If an image DOES have an alt but it is generic ('profile-image', 'photo', 'icon', 'avatar', 'img', 'image', 'picture', 'profile') — this is domSnapshot 'isGenericAlt: true': message = "Non-Descriptive Alt Text", category = 'content'. Do NOT say "Missing Alt Text".
-- Always check the domSnapshot 'images' array and its 'hasAlt' + 'isGenericAlt' flags before classifying alt issues.
+- If an image has NO alt attribute at all (Axe ruleId: 'image-alt', domSnapshot \`hasAlt: false\`): message = "Missing Alt Attribute", category = 'content'. Write a descriptive suggestedFix.
+- If an image DOES have an alt but it is generic ('profile-image', 'photo', 'icon', 'avatar', 'img', 'image', 'picture', 'profile') — this is domSnapshot \`isGenericAlt: true\`: message = "Non-Descriptive Alt Text", category = 'content'. Do NOT say "Missing Alt Text" or "Missing Alt Attribute". The attribute EXISTS — it just needs a better value.
+- ALWAYS check the domSnapshot images array and its hasAlt + isGenericAlt flags before classifying. If hasAlt is true and isGenericAlt is true, it MUST be "Non-Descriptive Alt Text", never "Missing".
 
 ### COLOR-CONTRAST REPORTING (REQUIRED — highest-volume category on most pages):
 Color contrast is the #1 cause of accessibility failures. Axe's 'color-contrast' ruleId fires once per element — a page can have 10–40+ affected elements:
