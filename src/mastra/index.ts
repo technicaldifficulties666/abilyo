@@ -69,11 +69,15 @@ let stagehandInstance: Stagehand | null = null;
 
 async function getStagehand(): Promise<Stagehand> {
   if (!stagehandInstance) {
-    const env = process.env.STAGEHAND_ENV || 'LOCAL';
+    const env = (process.env.STAGEHAND_ENV || 'LOCAL') as 'LOCAL' | 'BROWSERBASE';
     stagehandInstance = new Stagehand({
-      env: env as 'LOCAL' | 'BROWSERBASE',
+      env,
       verbose: 1,
       debugDom: true,
+      ...(env === 'BROWSERBASE' && {
+        apiKey: process.env.BROWSERBASE_API_KEY,
+        projectId: process.env.BROWSERBASE_PROJECT_ID,
+      }),
     });
     await stagehandInstance.init();
   }
