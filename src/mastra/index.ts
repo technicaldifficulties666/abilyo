@@ -358,7 +358,7 @@ const extractCodeSnippetsTool: any = createTool({
             return { html, cssSelector: tag };
           }, canonicalSelector);
           if (upgraded?.html) {
-            rawHTML = upgraded.html;
+            rawHTML = upgraded.html.replace(/\0/g, '');
             if (upgraded.cssSelector) canonicalSelector = upgraded.cssSelector;
             console.log(`[extract] useParentElement: upgraded to parent selector "${canonicalSelector}"`);
           }
@@ -399,10 +399,14 @@ TASK:
           : rawHTML || `<!-- Element matching "${selector}" — HTML not extractable -->`
       ).replace(/\0/g, '');
 
+      const stripNull = (s: string) => (s || '').replace(/\0/g, '');
+
       return {
         success: true,
         ...extraction,
         currentCode: finalCurrentCode,
+        suggestedFix: stripNull(extraction.suggestedFix),
+        explanation: stripNull(extraction.explanation),
         cssSelector: canonicalSelector, // always a CSS selector — use this as 'element'
       };
     } catch (error: any) {
@@ -583,14 +587,27 @@ const generateAccessibilityReportTool = createTool({
     }
 
     const filepath = path.join(reportsDir, filename);
-    fs.writeFileSync(filepath, JSON.stringify(finalReport, null, 2));
+    const stripNullDeep = (obj: any): any => {
+      if (typeof obj === 'string') return obj
+        .replace(/\x00([eE]9)/g, '\u00e9')  // malformed é encoding: \0e9 → é
+        .replace(/\0/g, '');                 // strip any remaining bare null bytes
+      if (Array.isArray(obj)) return obj.map(stripNullDeep);
+      if (obj && typeof obj === 'object') {
+        const out: any = {};
+        for (const k of Object.keys(obj)) out[k] = stripNullDeep(obj[k]);
+        return out;
+      }
+      return obj;
+    };
+    const cleanFinalReport = stripNullDeep(finalReport);
+    fs.writeFileSync(filepath, JSON.stringify(cleanFinalReport, null, 2));
 
     console.log(`💾 REPORT SAVED INTERNALLY TO: ${filepath}`);
     console.log(`📊 Compliance: ${complianceScore}% (${verdict}) | ${totalAffectedElements} affected elements across ${issues.length} rules`);
 
     return {
       success: true,
-      data: finalReport,
+      data: cleanFinalReport,
       filePath: filepath
     };
   },

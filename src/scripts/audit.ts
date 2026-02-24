@@ -190,7 +190,14 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
 
       const filepath = path.join(reportsDir, filename);
       // Final safeguard in audit.ts
-      const cleanReport = JSON.stringify(report, null, 2).replace(/\0/g, "");
+      const cleanReport = JSON.stringify(
+        report,
+        (_key, value) =>
+          typeof value === 'string'
+            ? value.replace(/\x00([eE]9)/g, '\u00e9').replace(/\0/g, '')
+            : value,
+        2
+      );
       fs.writeFileSync(filepath, cleanReport);
 
       console.log(`\n💾 Full report saved to: ${filepath}`);
