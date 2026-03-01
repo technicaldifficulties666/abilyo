@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Sample Page</title>
+  <style>
+    body { font-family: sans-serif; background: #fff; padding: 20px; }
+    .hero { background: #e5e7eb; padding: 40px; text-align: center; }
+    nav a { margin: 0 10px; }
+    .card { border: 1px solid #ccc; padding: 16px; margin: 10px 0; }
+  </style>
+</head>
+<body>
+
+  <!-- Issue 1: No skip-nav / no <main> landmark -->
+  <a href="#main-content" class="sr-only">Skip to main content</a>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/about">About</a>
+    <a href="/contact">Contact</a>
+  </nav>
+
+  <!-- Issue 2: Image missing alt attribute -->
+  <div class="hero">
+    <img src="hero.jpg" alt="Hero banner" style="width:100%;max-width:800px;">
+    <!-- Issue 3: Low-contrast text (#999 on white) -->
+    <p style="color: #595959; font-size: 18px;">Welcome to our website. We build great things.</p>
+  </div>
+
+  <div class="card">
+    <h2>Latest News</h2>
+    <!-- Issue 4: Link with no discernible text (icon-only) -->
+    <a href="/news/1">
+      <svg width="16" height="16" viewBox="0 0 16 16"><path d="M8 0L10 6h6l-5 4 2 6-5-4-5 4 2-6-5-4h6z"/></svg>
+    </a>
+    <p>Read our latest updates about product launches and company news.</p>
+  </div>
+
+  <!-- Issue 5: Button with no label -->
+  <button onclick="document.querySelector('form').submit()">
+    <svg width="20" height="20" viewBox="0 0 20 20"><path d="M10 2l8 16H2L10 2z"/></svg>
+  </button>
+
+  <footer>
+    <p style="color: #aaa; font-size: 12px;">© 2026 Abilyo Test Inc.</p>
+  </footer>
+
+</body>
+</html>

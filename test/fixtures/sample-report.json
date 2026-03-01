@@ -1,0 +1,53 @@
+{
+  "url": "file://test/fixtures/sample.html",
+  "pageTitle": "Sample Page",
+  "scanDate": "2026-03-01T00:00:00.000Z",
+  "summary": {
+    "totalIssues": 5,
+    "totalAffectedElements": 5,
+    "critical": 1,
+    "serious": 2,
+    "moderate": 2,
+    "minor": 0,
+    "complianceScore": 45,
+    "verdict": "non-compliant"
+  },
+  "issues": [],
+  "validationResults": {
+    "validatedAt": "2026-03-01T00:00:01.000Z",
+    "summary": { "total": 5, "validated": 5, "manual": 0, "validatedPct": 100 },
+    "issues": []
+  },
+  "approvedFixes": [
+    {
+      "element": ".hero img",
+      "message": "Missing Alt Attribute",
+      "wcagCriteria": "1.1.1",
+      "wcagName": "Non-text Content",
+      "severity": "critical",
+      "currentCode": "<img src=\"hero.jpg\" style=\"width:100%;max-width:800px;\">",
+      "suggestedFix": "<img src=\"hero.jpg\" alt=\"Hero banner\" style=\"width:100%;max-width:800px;\">",
+      "explanation": "Adding descriptive alt text ensures screen readers can convey the image content to visually impaired users."
+    },
+    {
+      "element": ".hero p",
+      "message": "Insufficient Color Contrast",
+      "wcagCriteria": "1.4.3",
+      "wcagName": "Contrast (Minimum)",
+      "severity": "serious",
+      "currentCode": "<p style=\"color: #999; font-size: 18px;\">Welcome to our website. We build great things.</p>",
+      "suggestedFix": "<p style=\"color: #595959; font-size: 18px;\">Welcome to our website. We build great things.</p>",
+      "explanation": "Changing color from #999 to #595959 achieves a contrast ratio of 7:1 against white, exceeding the WCAG AA minimum of 4.5:1."
+    },
+    {
+      "element": "nav a:first-child",
+      "message": "Missing Skip Navigation Link",
+      "wcagCriteria": "2.4.1",
+      "wcagName": "Bypass Blocks",
+      "severity": "moderate",
+      "currentCode": "  <nav>\n    <a href=\"/\">Home</a>",
+      "suggestedFix": "  <a href=\"#main-content\" class=\"sr-only\">Skip to main content</a>\n  <nav>\n    <a href=\"/\">Home</a>",
+      "explanation": "A skip navigation link lets keyboard users bypass the navigation and jump directly to the main content."
+    }
+  ]
+}
