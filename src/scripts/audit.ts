@@ -1,11 +1,29 @@
 #!/usr/bin/env ts-node
 
 import * as dotenv from "dotenv";
-import { aodaAuditorAgent, cleanup, AccessibilityReport } from "../mastra";
-import { z } from "zod";
+import * as readline from "readline";
+import {
+  aodaAuditorAgent,
+  cleanup,
+  validateFix,
+  isLeafFix,
+  AccessibilityReport,
+  AccessibilityIssue,
+} from "../mastra";
 
 // Load environment variables
 dotenv.config();
+
+// Prompt user with a yes/no question — defaults to Yes on Enter
+async function askYesNo(question: string): Promise<boolean> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.toLowerCase() !== "n");
+    });
+  });
+}
 
 // Validate environment
 function validateEnvironment() {
@@ -128,6 +146,36 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
       }
     }
 
+    // Last-resort fallback: generateLegacy() saves the report internally —
+    // read the most recently written file in reports/ so Phase 2 can still run.
+    let preloadedFilepath: string | null = null;
+    if (!report || !report.issues) {
+      const _fs = require("fs");
+      const _path = require("path");
+      const _dir = _path.join(process.cwd(), "reports");
+      if (_fs.existsSync(_dir)) {
+        const _files: string[] = _fs
+          .readdirSync(_dir)
+          .filter((f: string) => f.startsWith("accessibility-report-") && f.endsWith(".json"))
+          .sort()
+          .reverse();
+        if (_files.length > 0) {
+          try {
+            const _fp = _path.join(_dir, _files[0]);
+            const _content = _fs.readFileSync(_fp, "utf8");
+            const _parsed = JSON.parse(_content);
+            if (_parsed.issues) {
+              report = _parsed;
+              preloadedFilepath = _fp;
+              console.log(`\n📂 Loaded report from internally saved file: ${_fp}`);
+            }
+          } catch (_e) {
+            console.warn("Could not load fallback report file:", _e);
+          }
+        }
+      }
+    }
+
     if (report && report.issues) {
       // Display formatted report
       console.log("\n📋 ACCESSIBILITY AUDIT REPORT");
@@ -188,19 +236,168 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
         fs.mkdirSync(reportsDir, { recursive: true });
       }
 
-      const filepath = path.join(reportsDir, filename);
-      // Final safeguard in audit.ts
-      const cleanReport = JSON.stringify(
-        report,
-        (_key, value) =>
-          typeof value === 'string'
-            ? value.replace(/\x00([eE]9)/g, '\u00e9').replace(/\0/g, '')
-            : value,
-        2
-      );
-      fs.writeFileSync(filepath, cleanReport);
+      // If generateLegacy() already saved the file internally, reuse that path
+      // rather than writing a second redundant copy.
+      const filepath = preloadedFilepath || path.join(reportsDir, filename);
+      if (!preloadedFilepath) {
+        // Final safeguard in audit.ts
+        const cleanReport = JSON.stringify(
+          report,
+          (_key, value) =>
+            typeof value === 'string'
+              ? value.replace(/\x00([eE]9)/g, '\u00e9').replace(/\0/g, '')
+              : value,
+          2
+        );
+        fs.writeFileSync(filepath, cleanReport);
+        console.log(`\n💾 Full report saved to: ${filepath}`);
+      } else {
+        console.log(`\n📂 Using internally saved report: ${filepath}`);
+      }
 
-      console.log(`\n💾 Full report saved to: ${filepath}`);
+      // ── Phase 2: Validate fixes via DOM injection + axe re-check ──────────
+      console.log("\n\n" + "═".repeat(60));
+      console.log("🔬 PHASE 2: Validating fixes (DOM inject → axe → revert)...");
+      console.log("═".repeat(60));
+
+      interface ValidatedIssue {
+        issue: AccessibilityIssue;
+        status: "validated" | "manual";
+        reason?: string;
+      }
+      const validatedIssues: ValidatedIssue[] = [];
+
+      try {
+        for (let i = 0; i < report.issues.length; i++) {
+          const issue = report.issues[i];
+          const label = `[${i + 1}/${report.issues.length}] ${issue.message}`;
+          process.stdout.write(`\n  ${label} ... `);
+
+          try {
+            const result = await validateFix(
+              issue.element,
+              issue.suggestedFix,
+              issue.currentCode,
+            );
+
+            if (result.method === "skipped") {
+              process.stdout.write(`⚠️  MANUAL — ${result.reason}\n`);
+              validatedIssues.push({ issue, status: "manual", reason: result.reason });
+            } else if (result.passed) {
+              process.stdout.write(`✅ VALIDATED (axe passes after fix)\n`);
+              validatedIssues.push({ issue, status: "validated" });
+            } else {
+              process.stdout.write(`⚠️  MANUAL — ${result.reason || "axe still reports violations"}\n`);
+              validatedIssues.push({ issue, status: "manual", reason: result.reason });
+            }
+          } catch (issueErr: any) {
+            process.stdout.write(`⚠️  MANUAL — validation error: ${issueErr.message}\n`);
+            validatedIssues.push({ issue, status: "manual", reason: `Validation error: ${issueErr.message}` });
+          }
+        }
+      } catch (phase2Err: any) {
+        console.warn(`\n⚠️  Phase 2 loop error: ${phase2Err.message}`);
+      }
+
+      // ── Write Phase 2 results back to the same report file ────────────────
+      // Always runs — even if Phase 2 partially failed
+      console.log(`\n[DEBUG] Phase 2 complete. validatedIssues collected: ${validatedIssues.length}`);
+      const validated = validatedIssues.filter((v) => v.status === "validated");
+      const manual = validatedIssues.filter((v) => v.status === "manual");
+      console.log(`[DEBUG] validated=${validated.length} manual=${manual.length} filepath=${filepath}`);
+
+      try {
+        const enrichedReport = {
+          ...report,
+          validationResults: {
+            validatedAt: new Date().toISOString(),
+            summary: {
+              total: validatedIssues.length,
+              validated: validated.length,
+              manual: manual.length,
+              validatedPct: validatedIssues.length
+                ? Math.round((validated.length / validatedIssues.length) * 100)
+                : 0,
+            },
+            issues: validatedIssues.map(({ issue, status, reason }) => ({
+              element: issue.element,
+              message: issue.message,
+              wcagCriteria: issue.wcagCriteria,
+              severity: issue.severity,
+              status,
+              ...(reason ? { reason } : {}),
+            })),
+          },
+        };
+
+        const enrichedJson = JSON.stringify(
+          enrichedReport,
+          (_key, value) =>
+            typeof value === "string"
+              ? value.replace(/\x00([eE]9)/g, "\u00e9").replace(/\0/g, "")
+              : value,
+          2,
+        );
+        const phase2SavePath = preloadedFilepath || filepath;
+        fs.writeFileSync(phase2SavePath, enrichedJson);
+        console.log(`\n📝 Report updated with Phase 2 validation results: ${phase2SavePath}`);
+      } catch (saveErr: any) {
+        console.error(`\n❌ Failed to save Phase 2 results: ${saveErr.message}`);
+      }
+
+      // ── Phase 3: Interactive fix plan ──────────────────────────────────────
+
+      console.log("\n\n" + "═".repeat(60));
+      console.log(
+        `🔧 PHASE 3: FIX PLAN — ${validated.length} validated · ${manual.length} need manual review`,
+      );
+      console.log("═".repeat(60));
+
+      const approvedFixes: AccessibilityIssue[] = [];
+
+      if (validated.length > 0) {
+        console.log("\n✅ Axe-validated fixes ready to apply:\n");
+        for (let i = 0; i < validated.length; i++) {
+          const { issue } = validated[i];
+          const fixPreview =
+            issue.suggestedFix.length > 120
+              ? issue.suggestedFix.slice(0, 120) + "..."
+              : issue.suggestedFix;
+          console.log(`  [${i + 1}/${validated.length}] ${issue.message}`);
+          console.log(`  Selector : ${issue.element}`);
+          console.log(`  WCAG     : ${issue.wcagCriteria} — ${issue.wcagName}`);
+          console.log(`  Fix      : ${fixPreview}`);
+          const approve = await askYesNo(`  Apply this fix? [Y/n] `);
+          if (approve) {
+            approvedFixes.push(issue);
+            console.log(`  ✅ Approved\n`);
+          } else {
+            console.log(`  ⏭️  Skipped\n`);
+          }
+        }
+      }
+
+      if (manual.length > 0) {
+        console.log("\n⚠️  Manual fixes required:\n");
+        manual.forEach(({ issue, reason }) => {
+          console.log(`  • ${issue.message}  (${issue.element})`);
+          if (reason) console.log(`    Reason : ${reason}`);
+          const fixPreview =
+            issue.suggestedFix.length > 200
+              ? issue.suggestedFix.slice(0, 200) + "..."
+              : issue.suggestedFix;
+          console.log(`    Fix    : ${fixPreview}\n`);
+        });
+      }
+
+      console.log("─".repeat(60));
+      console.log(`\n  ✅ ${approvedFixes.length} fix(es) approved`);
+      console.log(`  ⚠️  ${manual.length} fix(es) require manual intervention`);
+      if (approvedFixes.length > 0) {
+        console.log(
+          `\n  💡 PatchAgent (coming next) will apply approved fixes to your source files.`,
+        );
+      }
     } else {
       // Display raw output if we couldn't parse the report
       console.log("\n📋 AGENT RESPONSE:\n");

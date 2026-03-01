@@ -617,6 +617,136 @@ const generateAccessibilityReportTool = createTool({
   },
 });
 
+// ── Fix Validation Utilities ────────────────────────────────────────────────
+// Used by audit.ts Phase 2: apply fix to live DOM → re-run axe → revert.
+// Only leaf-attribute fixes (same tag, no new children) are auto-validated.
+// Structural fixes (tag changes, new child elements) are flagged manual.
+
+/**
+ * Returns true if the fix is a pure attribute change on the same element.
+ * Leaf fixes can be safely applied/reverted via page.evaluate() for axe validation.
+ */
+export function isLeafFix(currentCode: string, suggestedFix: string): boolean {
+  const rootTag = (html: string) =>
+    html.trim().match(/^<([a-z][a-z0-9]*)/i)?.[1]?.toLowerCase();
+  const ct = rootTag(currentCode);
+  const ft = rootTag(suggestedFix);
+  if (!ct || !ft || ct !== ft) return false; // tag changed or no tag (comment/placeholder)
+  const countOpenTags = (html: string) => (html.match(/<[a-zA-Z][^/]*>/g) || []).length;
+  return countOpenTags(suggestedFix) <= countOpenTags(currentCode); // no new children
+}
+
+export interface FixValidationResult {
+  passed: boolean;
+  method: 'axe' | 'skipped';
+  reason?: string;
+}
+
+/**
+ * Validates a suggested fix against the live DOM:
+ * 1. Injects only the changed attributes onto the element
+ * 2. Re-runs axe scoped to that element
+ * 3. Reverts the DOM to its prior state
+ */
+export async function validateFix(
+  selector: string,
+  suggestedFix: string,
+  currentCode: string,
+): Promise<FixValidationResult> {
+  if (!isLeafFix(currentCode, suggestedFix)) {
+    return { passed: false, method: 'skipped', reason: 'Structural fix — manual review required' };
+  }
+
+  // Parse attribute key=value pairs from an HTML opening tag
+  function parseAttributes(html: string): Record<string, string> {
+    const attrs: Record<string, string> = {};
+    const tagContent = html.match(/^<[a-z][a-z0-9]*\s*([\s\S]*?)(?:\s*\/?>|>)/i)?.[1] || '';
+    const re = /([\w-]+)(?:\s*=\s*"([^"]*)"|\s*=\s*'([^']*)')?/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(tagContent)) !== null) {
+      attrs[m[1]] = m[2] ?? m[3] ?? '';
+    }
+    return attrs;
+  }
+
+  const currentAttrs = parseAttributes(currentCode);
+  const fixAttrs = parseAttributes(suggestedFix);
+  const changedAttrs: Record<string, string> = {};
+  for (const [key, val] of Object.entries(fixAttrs)) {
+    if (currentAttrs[key] !== val) changedAttrs[key] = val;
+  }
+
+  if (Object.keys(changedAttrs).length === 0) {
+    return { passed: false, method: 'skipped', reason: 'No attribute changes detected' };
+  }
+
+  const stagehand = await getStagehand();
+  try {
+    // 1. Store original attribute values for revert
+    const originalAttrs = await stagehand.page.evaluate(
+      ({ sel, keys }: { sel: string; keys: string[] }) => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const orig: Record<string, string | null> = {};
+        for (const k of keys) orig[k] = el.getAttribute(k);
+        return orig;
+      },
+      { sel: selector, keys: Object.keys(changedAttrs) },
+    );
+
+    if (!originalAttrs) {
+      return { passed: false, method: 'skipped', reason: `Selector "${selector}" not found` };
+    }
+
+    // 2. Apply changed attributes
+    await stagehand.page.evaluate(
+      ({ sel, attrs }: { sel: string; attrs: Record<string, string> }) => {
+        const el = document.querySelector(sel);
+        if (!el) return;
+        for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+      },
+      { sel: selector, attrs: changedAttrs },
+    );
+
+    // 3. Re-run axe scoped to this element
+    await injectAxe(stagehand.page);
+    const axeResult = await stagehand.page.evaluate(async (sel: string) => {
+      const el = document.querySelector(sel);
+      const context = el || document;
+      const results = await (window as any).axe.run(context, {
+        runOnly: { type: 'tag', values: ['wcag2a', 'wcag2aa', 'wcag21aa', 'wcag22aa'] },
+      });
+      return {
+        passed: results.violations.length === 0,
+        violations: results.violations.map((v: any) => v.id) as string[],
+      };
+    }, selector);
+
+    // 4. Revert to original state
+    await stagehand.page.evaluate(
+      ({ sel, attrs }: { sel: string; attrs: Record<string, string | null> }) => {
+        const el = document.querySelector(sel);
+        if (!el) return;
+        for (const [k, v] of Object.entries(attrs)) {
+          if (v === null) el.removeAttribute(k);
+          else el.setAttribute(k, v);
+        }
+      },
+      { sel: selector, attrs: originalAttrs },
+    );
+
+    return {
+      passed: axeResult.passed,
+      method: 'axe',
+      reason: !axeResult.passed
+        ? `Remaining violations: ${axeResult.violations.join(', ')}`
+        : undefined,
+    };
+  } catch (err: any) {
+    return { passed: false, method: 'skipped', reason: `Validation error: ${err.message}` };
+  }
+}
+
 // System prompt for the AODA-Auditor agent
 const SYSTEM_PROMPT = `You are an expert Web Accessibility Auditor specializing in WCAG 2.2 Level AA, AODA, ADA and EAA compliance.
 
