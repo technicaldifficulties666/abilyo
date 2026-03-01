@@ -5,6 +5,7 @@
   "main": "dist/index.js",
   "scripts": {
     "audit": "ts-node src/scripts/audit.ts",
+    "patch": "ts-node src/scripts/patch.ts",
     "build": "tsc",
     "dev": "ts-node src/scripts/audit.ts"
   },

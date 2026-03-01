@@ -393,10 +393,34 @@ Call 'generate_accessibility_report' with the complete deduplicated list.
       console.log("─".repeat(60));
       console.log(`\n  ✅ ${approvedFixes.length} fix(es) approved`);
       console.log(`  ⚠️  ${manual.length} fix(es) require manual intervention`);
+
+      // ── Persist approvedFixes back to the report JSON ─────────────────────
       if (approvedFixes.length > 0) {
-        console.log(
-          `\n  💡 PatchAgent (coming next) will apply approved fixes to your source files.`,
-        );
+        try {
+          const phase3SavePath = preloadedFilepath || filepath;
+          const currentJson = JSON.parse(fs.readFileSync(phase3SavePath, "utf8"));
+          currentJson.approvedFixes = approvedFixes.map((issue) => ({
+            element: issue.element,
+            message: issue.message,
+            wcagCriteria: issue.wcagCriteria,
+            wcagName: issue.wcagName,
+            severity: issue.severity,
+            currentCode: issue.currentCode,
+            suggestedFix: issue.suggestedFix,
+            explanation: issue.explanation,
+          }));
+          fs.writeFileSync(
+            phase3SavePath,
+            JSON.stringify(currentJson, (_key, value) =>
+              typeof value === "string"
+                ? value.replace(/\x00([eE]9)/g, "\u00e9").replace(/\0/g, "")
+                : value, 2),
+          );
+          console.log(`\n💾 Approved fixes saved to report — ready for PatchAgent`);
+          console.log(`   Run: npm run patch -- "${phase3SavePath}" <source-dir>`);
+        } catch (saveErr: any) {
+          console.warn(`\n⚠️  Could not save approved fixes: ${saveErr.message}`);
+        }
       }
     } else {
       // Display raw output if we couldn't parse the report
