@@ -202,15 +202,20 @@ async function runPatchAgent(
   }
 
   // ── Summary ──────────────────────────────────────────────────────────────
-  const applied = results.filter((r) => r.applied);
+  const applied  = results.filter((r) => r.applied);
   const notFound = results.filter((r) => !r.applied && r.reason?.includes("not found"));
-  const skipped  = results.filter((r) => !r.applied && !r.reason?.includes("not found"));
+  const dryruns  = results.filter((r) => r.reason === "dry-run");
+  const skipped  = results.filter((r) => !r.applied && r.reason === "skipped by user");
 
   console.log("\n" + "═".repeat(60));
   console.log("📊 PATCH SUMMARY");
   console.log("═".repeat(60));
-  console.log(`  ✅ Applied  : ${applied.length}`);
-  console.log(`  ⏭️  Skipped  : ${skipped.length}`);
+  if (dryRun) {
+    console.log(`  🧪 Would apply: ${dryruns.length}`);
+  } else {
+    console.log(`  ✅ Applied  : ${applied.length}`);
+    console.log(`  ⏭️  Skipped  : ${skipped.length}`);
+  }
   console.log(`  ❌ Not found: ${notFound.length}`);
 
   if (notFound.length) {
@@ -220,7 +225,10 @@ async function runPatchAgent(
     });
   }
 
-  if (applied.length && !dryRun) {
+  if (dryRun && dryruns.length) {
+    console.log(`\n✅ Dry run complete — ${dryruns.length} fix(es) ready to apply.`);
+    console.log(`   Re-run without --dry-run to write changes.\n`);
+  } else if (applied.length && !dryRun) {
     console.log(`\n✅ ${applied.length} file(s) patched. Ready to commit!\n`);
     console.log(`  git diff`);
     console.log(`  git add -A && git commit -m "a11y: apply ${applied.length} accessibility fix(es)"`);
